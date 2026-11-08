@@ -1,0 +1,59 @@
+{
+    "name": "DigitalCurling4-Learning",
+    "build": {
+        "dockerfile": "../Dockerfile",
+        "context": "..",
+        "target": "dev",
+        "args": {
+            // Keep in sync with DigitalCurling4-CNN's libtorch build (see Dockerfile).
+            "CUDA_VERSION": "13.4.3",
+            "UBUNTU_VERSION": "26.04",
+            // Same as .python-version.
+            "PYTHON_VERSION": "3.13",
+            // Optional, off by default: set DC4_CLAUDE_CODE=1 in .devcontainer/local.env
+            // (read by dev.sh) or in the environment VS Code starts from.
+            "INSTALL_CLAUDE_CODE": "${localEnv:DC4_CLAUDE_CODE:0}"
+        }
+    },
+    "runArgs": [
+        "--gpus=all",
+        // PyTorch DataLoader workers share batches through /dev/shm.
+        "--shm-size=4g",
+        "--name=dc4-learning-dev"
+    ],
+    // Rootless Docker: container root == host user, so bind-mounted files keep
+    // host ownership.
+    "remoteUser": "root",
+    "updateRemoteUserUID": false,
+    "workspaceFolder": "/workspaces/${localWorkspaceFolderBasename}",
+    "mounts": [
+        // The venv (torch + CUDA wheels, several GB) and uv's download cache live in
+        // named volumes, so they survive container rebuilds and stay off the bind mount.
+        "source=dc4-learning-venv,target=/opt/venv,type=volume",
+        "source=dc4-learning-uv-cache,target=/root/.cache/uv,type=volume"
+        // Personal volumes (Claude Code, GitHub CLI, git config) and the host
+        // ssh-agent are added by dev.sh when enabled in .devcontainer/local.env.
+    ],
+    "containerEnv": {
+        "MATPLOTLIBRC": "${containerWorkspaceFolder}/matplotlibrc"
+    },
+    "postCreateCommand": "uv sync",
+    // Trust a private CA if DC4_CA_CERT is configured (dev.sh sets it) or
+    // .devcontainer/ca.crt exists, and if you set up commit signing, warn
+    // (non-fatally) when it would fail. Silent otherwise.
+    "postStartCommand": "if [ -n \"${DC4_CA_CERT:-}\" ] || [ -f .devcontainer/ca.crt ]; then .devcontainer/setup-ca.sh; fi; .devcontainer/setup-signing.sh --check",
+    "customizations": {
+        "vscode": {
+            "extensions": [
+                "ms-python.python",
+                "ms-toolsai.jupyter",
+                "charliermarsh.ruff",
+                "editorconfig.editorconfig"
+            ],
+            "settings": {
+                "python.defaultInterpreterPath": "/opt/venv/bin/python",
+                "python.terminal.activateEnvironment": false
+            }
+        }
+    }
+}

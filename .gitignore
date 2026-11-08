@@ -1,0 +1,18 @@
+__pycache__/
+*.py[cod]
+.venv/
+.ipynb_checkpoints/
+*.egg-info/
+dist/
+build/
+data/
+runs/
+*.pt
+*.pth
+# Tracked here even though ~/.config/git/ignore excludes .devcontainer/ globally.
+!.devcontainer/
+.devcontainer/local.env
+.devcontainer/ca.crt
+
+# Local settings (server, cluster)
+.env

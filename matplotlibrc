@@ -1,0 +1,17 @@
+## Personal defaults, from ~/docker/pytorch/matplotlibrc (only the non-default lines).
+## Picked up via MATPLOTLIBRC (set in .devcontainer/devcontainer.json).
+## text.usetex is off: the image has no LaTeX. Install texlive and set it to True if needed.
+font.family         : serif
+text.usetex         : False
+axes.axisbelow      : True
+grid.linewidth      : 0.3
+figure.figsize      : 7.2, 5.4
+figure.dpi          : 300
+figure.subplot.left    : 0.20
+figure.subplot.right   : 0.95
+figure.subplot.bottom  : 0.22
+figure.subplot.top     : 0.95
+errorbar.capsize    : 2.5
+savefig.format      : pdf
+savefig.bbox        : tight
+savefig.pad_inches  : 0.05

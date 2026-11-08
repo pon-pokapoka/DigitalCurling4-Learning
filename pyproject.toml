@@ -1,0 +1,40 @@
+[project]
+name = "dc4learning"
+version = "0.1.0"
+description = "Log analysis, training and self-play for DigitalCurling4"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.13"
+dependencies = [
+    "numpy",
+    "pandas",
+    "matplotlib",
+    # Must match the libtorch in DigitalCurling4-CNN (2.15.0+cu134) so exported
+    # models load in the C++ client. Bump both repos together.
+    "torch==2.15.0",
+]
+
+[dependency-groups]
+dev = [
+    "ipykernel",
+    "ruff",
+]
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu134" }
+
+[[tool.uv.index]]
+name = "pytorch-cu134"
+url = "https://download.pytorch.org/whl/cu134"
+explicit = true
+
+[tool.uv]
+# Linux x86_64 only: the dev container and the cluster.
+environments = ["sys_platform == 'linux' and platform_machine == 'x86_64'"]
+
+[tool.ruff]
+line-length = 120
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
