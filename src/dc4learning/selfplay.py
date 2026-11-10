@@ -168,11 +168,27 @@ def match_images(args: argparse.Namespace, n: int) -> tuple[str, str]:
     return (args.image, args.opponent_image) if n % 2 else (args.opponent_image, args.image)
 
 
+def version_label(image: str) -> str:
+    """What a match name says about a team: its version ID (`<client>.<model>.<model hash>`,
+    from the version records) or, for an unrecorded image, its tag."""
+    return versions.version_id(image) or image_tag(image)
+
+
 def match_name(args: argparse.Namespace, n: int) -> str:
-    """<prefix>-<image>-<ts>-m<n>, or <prefix>-<image0>-vs-<image1>-<ts>-m<n>; parsed by dc4learning.data."""
-    a, b = (image_tag(i) for i in match_images(args, n))
-    images = a if a == b else f"{a}-vs-{b}"
-    return f"{args.match_prefix}-{images}-{datetime.now():%Y%m%d-%H%M%S}-m{n}"
+    """<prefix>-<version>-<ts>-m<n>, or <prefix>-<team0 version>-vs-<team1 version>-<ts>-m<n>.
+
+    The server stores the name, so its database records what played each match; dc4learning.data
+    and dc4learning.versions read it back."""
+    a, b = (version_label(i) for i in match_images(args, n))
+    teams = a if a == b else f"{a}-vs-{b}"
+    return f"{args.match_prefix}-{teams}-{datetime.now():%Y%m%d-%H%M%S}-m{n}"
+
+
+def default_tournament(args: argparse.Namespace) -> str:
+    """One tournament per run: selfplay-<version>, or eval-<candidate>-vs-<opponent> (sides alternate)."""
+    if args.opponent_image:
+        return f"eval-{version_label(args.image)}-vs-{version_label(args.opponent_image)}"
+    return f"{args.match_prefix}-{version_label(args.image)}"
 
 
 def job_manifest(args: argparse.Namespace, match_id: str, match_name: str, team: int, image: str) -> dict:
@@ -284,42 +300,13 @@ def start_match(args: argparse.Namespace, n: int) -> None:
     name = match_name(args, n)
     images = match_images(args, n)
     match_id = create_match(args, name)
-    log(f"match {n}: created {name} ({match_id})")
-    if not args.dry_run:
-        safe_record(
-            match_id,
-            match_name=name,
-            created_at=datetime.now().astimezone().isoformat(timespec="seconds"),
-            namespace=args.namespace,
-            run_label=args.run_label,
-            teams={f"team{t}": {"image": images[t]} for t in (0, 1)},
-            status="running",
-        )
+    if args.verbose or args.dry_run:
+        log(f"match {n}: created {name} ({match_id})")
+    # Nothing is stored locally per match: the server's match and tournament names carry each
+    # team's version ID (see version_label), and its database holds everything else.
     for team in (0, 1):
         manifest = job_manifest(args, match_id, name, team, images[team])
         kubectl(args, "create", "-f", "-", stdin=json.dumps(manifest))
-
-
-def safe_record(match_id: str, **info) -> None:
-    """versions.record_match, but a failure to write only warns: it must not stop self-play."""
-    try:
-        versions.record_match(match_id, **info)
-    except OSError as e:
-        log(f"warning: could not record versions of {match_id}: {e}")
-
-
-def pod_versions(args: argparse.Namespace, match_id: str) -> dict:
-    """{"team0": {"image_id", "node"}, ...} from the match's pods: the image each pod actually ran."""
-    out = json.loads(kubectl(args, "get", "pods", "-l", f"{MATCH_LABEL}={match_id}", "-o", "json"))
-    teams = {}
-    for pod in out["items"]:
-        team = pod["metadata"]["labels"].get(TEAM_LABEL)
-        statuses = pod.get("status", {}).get("containerStatuses") or []
-        if team is None or not statuses or not statuses[0].get("imageID"):
-            continue
-        image_id = statuses[0]["imageID"].rsplit("@", 1)[-1]  # some runtimes prefix the repository
-        teams[f"team{team}"] = {"image_id": image_id, "node": pod["spec"].get("nodeName")}
-    return teams
 
 
 def run(args: argparse.Namespace) -> int:
@@ -348,19 +335,8 @@ def run(args: argparse.Namespace) -> int:
                 failed += not ok
                 consecutive_failures = 0 if ok else consecutive_failures + 1
                 teams = ", ".join(f"t{j['metadata']['labels'][TEAM_LABEL]}={s}" for j, s in zip(jobs, states))
-                log(f"match {match_id} {'finished' if ok else 'FAILED'} ({teams}); {finished} ok, {failed} failed")
-                try:
-                    ran = pod_versions(args, match_id)
-                except (subprocess.CalledProcessError, ValueError) as e:
-                    ran = {}
-                    log(f"warning: could not read the pods of {match_id}: {e}")
-                safe_record(
-                    match_id,
-                    teams=ran,
-                    status="finished" if ok else "failed",
-                    jobs={f"team{j['metadata']['labels'][TEAM_LABEL]}": s for j, s in zip(jobs, states)},
-                    ended_at=datetime.now().astimezone().isoformat(timespec="seconds"),
-                )
+                if args.verbose or not ok:  # the server records every finished game; log only failures
+                    log(f"match {match_id} {'finished' if ok else 'FAILED'} ({teams}); {finished} ok, {failed} failed")
                 kubectl(args, "delete", "jobs", "-l", f"{MATCH_LABEL}={match_id}", "--wait=false")
             else:
                 running += 1
@@ -421,18 +397,23 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--deadline", type=int, default=3600, help="activeDeadlineSeconds per client Job")
     p.add_argument("--poll", type=float, default=10, help="seconds between checks")
     p.add_argument("--max-consecutive-failures", type=int, default=3)
-    p.add_argument("--match-prefix", default="selfplay", help="match names: <prefix>-<image tag(s)>-<time>-m<n>")
+    p.add_argument(
+        "--match-prefix",
+        default=None,
+        help="match names: <prefix>-<version(s)>-<time>-m<n> (default: selfplay or eval)",
+    )
     g = p.add_argument_group("game")
     # Defaults: the official 10-end setting (DigitalCurling3 wiki, server config v1.1 / GAT2023
     # regulation): 10 ends, 219 s per team, 21.9 s per extra end, fcv1, five-rock (FGZ) rule.
     g.add_argument("--game-mode", default="standard")
-    g.add_argument("--tournament", default="self-play")
+    g.add_argument("--tournament", default=None, help="default: selfplay-<version> or eval-<candidate>-vs-<opponent>")
     g.add_argument("--simulator", default="fcv1")
     g.add_argument("--applied-rule", default="fgz_rule")
     g.add_argument("--time-limit", type=float, default=219, help="seconds per team for the standard ends")
     g.add_argument("--extra-end-time-limit", type=float, default=21.9, help="seconds per team per extra end")
     g.add_argument("--end-count", type=int, default=10)
     g.add_argument("--positioned-pattern", type=int, default=0)
+    p.add_argument("--verbose", action="store_true", help="also log every match start and finish")
     p.add_argument("--dry-run", action="store_true", help="print one match's Job manifests and exit")
     args = p.parse_args(argv)
 
@@ -447,6 +428,8 @@ def main(argv: list[str] | None = None) -> int:
     if missing:
         p.error("missing settings, pass them or set them in .env: " + ", ".join(missing))
     args.creator_secret = args.creator_secret or args.team0_secret
+    args.match_prefix = args.match_prefix or ("eval" if args.opponent_image else "selfplay")
+    args.tournament = args.tournament or default_tournament(args)
     return run(args)
 
 
