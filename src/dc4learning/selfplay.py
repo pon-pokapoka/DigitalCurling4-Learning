@@ -207,6 +207,9 @@ def job_manifest(args: argparse.Namespace, match_id: str, match_name: str, team:
         {"name": "DC_AUTH_ID", "valueFrom": {"secretKeyRef": {"name": secret, "key": "auth-id"}}},
         {"name": "DC_AUTH_PW", "valueFrom": {"secretKeyRef": {"name": secret, "key": "auth-pw"}}},
     ]
+    for item in filter(None, (args.client_env or "").split(",")):
+        key, _, value = item.strip().partition("=")
+        env.append({"name": key, "value": value})
     if args.threads:
         env.append({"name": "DC_CLIENT_THREADS", "value": str(args.threads)})
     else:
@@ -393,6 +396,11 @@ def main(argv: list[str] | None = None) -> int:
     )
     p.add_argument("--runtime-class", default=env("SELFPLAY_RUNTIME_CLASS", "nvidia"), help="'' to omit")
     p.add_argument("--image-pull-secret", default=env("SELFPLAY_IMAGE_PULL_SECRET"))
+    p.add_argument(
+        "--client-env",
+        default=env("SELFPLAY_CLIENT_ENV"),
+        help="extra environment of the clients, KEY=VALUE[,KEY=VALUE...], e.g. DC_TEAM_NAME_FULL=1",
+    )
     p.add_argument("--threads", type=int, default=0, help="search threads per client; 0 = all node CPUs")
     p.add_argument("--deadline", type=int, default=3600, help="activeDeadlineSeconds per client Job")
     p.add_argument("--poll", type=float, default=10, help="seconds between checks")
