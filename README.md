@@ -54,12 +54,14 @@ docker build --target train -t ghcr.io/pon-pokapoka/dc4-learning:<tag> .
   Server URL comes from `DC_SERVER_URL`, from the environment or the repo's `.env`.
 - `src/dc4learning/sheet.py`: sheet geometry (meters), drawing helpers, and the DC3-style pixel grid.
 - `src/dc4learning/selfplay.py`: self-play and evaluation matches on the cluster.
-- `src/dc4learning/data.py`: downloads finished matches and builds training datasets.
+- `src/dc4learning/data.py`: reads finished matches from the server and builds training datasets.
 - `src/dc4learning/encoding.py`: model input and targets, exactly as the C++ client builds and reads them.
 - `src/dc4learning/model.py`: the client's network as a trainable module; loads and exports `traced.pt`.
 - `src/dc4learning/train.py`: training, with TensorBoard logs and client-ready exports every epoch.
 - `src/dc4learning/stats.py`: self-play status and results.
 - `src/dc4learning/versions.py`: which client and model played each match, and each model's lineage.
+- `src/dc4learning/naming.py`: file names and sidecars that record where models, datasets and tables came from.
+- `src/dc4learning/wintable.py`: the client's win table, estimated from self-play games.
 - `scripts/client-image.sh`, `scripts/model-image.sh`: client images from a CNN commit or with a trained
   model, recorded and loaded into the cluster.
 - `notebooks/inspect_latest_game.ipynb`: draws every shot of the latest match.
@@ -92,16 +94,16 @@ node (`imagePullPolicy: IfNotPresent`, so an image imported into containerd work
 
 ## Logs, training and evaluation
 
-The loop is: self-play with the current client, download the games, train, build a client image with
+The loop is: self-play with the current client, read the games from the server, train, build a client image with
 the trained model, play it against the current one, and promote it if it wins.
 
 ```bash
 scripts/client-image.sh ../DigitalCurling4-CNN origin/development gen0   # cnn-client:<commit>, model named gen0
-python -m dc4learning.data sync                        # download new finished matches to data/
-python -m dc4learning.data build --model gen0          # dataset from games where both teams ran gen0
-python -m dc4learning.train --data data/datasets/<name>.npz --init data/models/best.pt --name gen1
-scripts/model-image.sh runs/gen1/traced-007.pt gen1    # cnn-client:<commit>_gen1, imported via IMAGE_IMPORT_CMD
-python -m dc4learning.selfplay --opponent-image cnn-client:<commit>_gen1 --matches 200   # evaluation
+python -m dc4learning.data build --model gen0          # data/datasets/selfplay-gen0-n<matches>-<hash>.npz
+python -m dc4learning.train --data data/datasets/selfplay-gen0-n<...>.npz --init data/models/best.pt --name gen1
+scripts/model-image.sh runs/gen1/gen1-e007-p<...>.pt   # cnn-client:<commit>_gen1-<hash>, imported via IMAGE_IMPORT_CMD
+python -m dc4learning.selfplay --opponent-image cnn-client:<commit>_gen1-<hash> --matches 200   # evaluation
+python -m dc4learning.wintable --model gen0            # optional: a win table from the same games
 python -m dc4learning.stats                            # wins per client/model pair, binomial test
 ```
 
@@ -120,29 +122,49 @@ which is how `data` and `stats` tell generations apart. In evaluation the two im
 Every match is attributable to a client commit and a model, and every trained model to its parent
 model and training games (`python -m dc4learning.versions list`, `... show <match_id>`):
 
-- An image is identified by its Docker image ID, which is also what the cluster reports for the image a
-  pod ran. The self-play loop records it per team when a match ends (`data/versions/matches/`), so a
-  re-tagged image can't be mistaken for another.
+- An image is identified by its Docker image ID (`data/versions/images.json`); a match by the version ID
+  in its server-side match and tournament names. Matches played before the names carried version IDs
+  are linked through per-match records in `data/versions/matches/` (no longer written for new matches).
 - A model is identified by the sha256 of its `traced.pt`; the CNN repo doesn't track model files, so its
   commit alone doesn't say which model an image runs. Names (`gen0`, `gen1`, ...) are labels on top.
-- Model files keep a versioned name, `<generation>-<first 8 hex of sha256>.pt` (e.g. `gen0-588f425c.pt`),
-  and are used through links: `src/engine/model/traced.pt` in the CNN repo (and `win_table.csv` ->
-  `win_table-<hash>.csv`), and `data/models/best.pt` here for the current champion. `model-image.sh`
-  keeps each model it packages in `data/models/`; promoting a generation is repointing `best.pt`.
+- File names record where a file came from (`dc4learning/naming.py`). Every artifact ends in the first
+  8 hex digits of its own sha256 and names its inputs by theirs, so the chain can be followed by file
+  name alone; a sidecar `<same name>.json` adds the commit of this repo that made it, the parameters,
+  and the match IDs:
+
+  | Artifact | Name | Example |
+  |---|---|---|
+  | model | `<gen>-e<epoch>-p<parent>-d<dataset>-<hash>.pt` | `gen1-e007-p588f425c-d372b3689-3f2a9c1d.pt` |
+  | dataset | `<selection>-n<matches>-<hash>.npz` | `selfplay-gen0-n539-372b3689.npz` |
+  | win table | `win_table-<selection>-n<matches>-<hash>.csv` | `win_table-selfplay-gen0-n539-ef24445e.csv` |
+  | root (origin not recorded) | `<gen>-<hash>.pt`, `win_table-<hash>.csv` | `gen0-588f425c.pt` |
+
+  `train` names its exports this way (the generation is the parent's + 1, or the same when resuming a
+  checkpoint), `data build` its datasets and `wintable` its tables. `python -m dc4learning.versions trace
+  <file>` follows the chain and checks each file still matches its hash.
+- Consumers use links with the names they expect: `src/engine/model/traced.pt` and `win_table.csv` in the
+  CNN repo, `data/models/best.pt` here for the current champion. `model-image.sh` keeps each model it
+  packages (with its sidecar) in `data/models/` and tags the image `<base tag>_<gen>-<hash>`; promoting a
+  generation is repointing `best.pt` (and, for new client builds, the CNN repo's links).
 - `client-image.sh` and `model-image.sh` record images and models and also stamp the facts into the
   image as labels; `train` writes the starting model's sha256 and the dataset's makeup into
   `runs/<name>/args.json`, which `model-image.sh` reads for the lineage.
 - `data` and `stats` add `client0/1`, `model0/1` and `image_id0/1` to every match; `data build` can
   select by `--model` or `--client` and writes `<dataset>.json` with the versions that played its games.
 
-These records live in `data/` (not committed), so back that directory up.
+Nothing the server's database already holds is kept here: games are read from the server when a
+dataset, win table or report needs them (`data.games`, `data.load_match`). `data/` (not committed)
+keeps only what the server doesn't have, so back it up: model files and sidecars, datasets, win
+tables, the image/model catalog, and the per-match records of older matches (see above). Match and
+tournament names carry each team's version ID
+(`<client commit>.<model>.<model hash>`), so the server's records say what played each game.
 
 ### Monitoring
 
 | What | How |
 |---|---|
-| The self-play loop | its log: `tail -f logs/selfplay.log` (if started with `>> logs/selfplay.log`) |
-| Matches on the cluster | `python -m dc4learning.stats` (also downloads new games), or `kubectl -n <namespace> get jobs` |
+| The self-play loop | its log: `tail -f logs/selfplay.log` (if started with `>> logs/selfplay.log`); only failures, warnings and stops unless `--verbose` |
+| Matches on the cluster | `python -m dc4learning.stats` (reads the games from the server), or `kubectl -n <namespace> get jobs` |
 | A running match | the server's viewer, `<server>/matches/<match_id>/viewer`; or `kubectl -n <namespace> logs job/<job>` |
 | Results so far | `watch -n 300 python -m dc4learning.stats`; `notebooks/selfplay_analysis.ipynb` for plots |
 | Training | `tensorboard --logdir runs` (port 6006): train/val losses, policy top-1/top-5, score accuracy |
