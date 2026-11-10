@@ -23,12 +23,14 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import signal
 import subprocess
 import sys
 import time
 from datetime import datetime
 
+from . import versions
 from .config import load_env
 
 SELFPLAY_LABEL = "dc4learning/selfplay"
@@ -65,7 +67,8 @@ def create_match(args: argparse.Namespace, name: str) -> str:
         "match_name": name,
         "positioned_stones_pattern": args.positioned_pattern,
     }
-    job_name = "create-" + name.lower()[-50:].strip("-")
+    # A valid Job name: lowercase alphanumerics and dashes, at most 63 characters.
+    job_name = "create-" + re.sub(r"[^a-z0-9-]+", "-", name.lower())[-50:].strip("-")
     labels = {SELFPLAY_LABEL + "-creator": args.run_label, CREATOR_LABEL: "true"}
     secret = args.creator_secret
     job = {
@@ -95,8 +98,14 @@ def create_match(args: argparse.Namespace, name: str) -> str:
                             "env": [
                                 {"name": "DC_HOST", "value": args.server_url.rstrip("/")},
                                 {"name": "PAYLOAD", "value": json.dumps(payload)},
-                                {"name": "DC_AUTH_ID", "valueFrom": {"secretKeyRef": {"name": secret, "key": "auth-id"}}},
-                                {"name": "DC_AUTH_PW", "valueFrom": {"secretKeyRef": {"name": secret, "key": "auth-pw"}}},
+                                {
+                                    "name": "DC_AUTH_ID",
+                                    "valueFrom": {"secretKeyRef": {"name": secret, "key": "auth-id"}},
+                                },
+                                {
+                                    "name": "DC_AUTH_PW",
+                                    "valueFrom": {"secretKeyRef": {"name": secret, "key": "auth-pw"}},
+                                },
                             ],
                             "resources": {"requests": {"cpu": "10m", "memory": "16Mi"}, "limits": {"memory": "64Mi"}},
                             "securityContext": {
@@ -145,7 +154,28 @@ def kubectl(args: argparse.Namespace, *cmd: str, stdin: str | None = None) -> st
     return subprocess.run(full, input=stdin, capture_output=True, text=True, check=True).stdout
 
 
-def job_manifest(args: argparse.Namespace, match_id: str, match_name: str, team: int) -> dict:
+def image_tag(image: str) -> str:
+    """Short label of an image for match names: its tag (or name), without dashes."""
+    tag = image.rsplit("/", 1)[-1]
+    tag = tag.split(":", 1)[1] if ":" in tag else tag
+    return tag.replace("-", "_")
+
+
+def match_images(args: argparse.Namespace, n: int) -> tuple[str, str]:
+    """(team0 image, team1 image) of match n. With an opponent, the sides alternate."""
+    if not args.opponent_image:
+        return args.image, args.image
+    return (args.image, args.opponent_image) if n % 2 else (args.opponent_image, args.image)
+
+
+def match_name(args: argparse.Namespace, n: int) -> str:
+    """<prefix>-<image>-<ts>-m<n>, or <prefix>-<image0>-vs-<image1>-<ts>-m<n>; parsed by dc4learning.data."""
+    a, b = (image_tag(i) for i in match_images(args, n))
+    images = a if a == b else f"{a}-vs-{b}"
+    return f"{args.match_prefix}-{images}-{datetime.now():%Y%m%d-%H%M%S}-m{n}"
+
+
+def job_manifest(args: argparse.Namespace, match_id: str, match_name: str, team: int, image: str) -> dict:
     labels = {
         "app.kubernetes.io/name": "cnn-client",
         "app.kubernetes.io/component": "client",
@@ -168,7 +198,9 @@ def job_manifest(args: argparse.Namespace, match_id: str, match_name: str, team:
         env.append(
             {
                 "name": "DC_CLIENT_THREADS",
-                "valueFrom": {"resourceFieldRef": {"containerName": "client", "resource": "limits.cpu", "divisor": "1"}},
+                "valueFrom": {
+                    "resourceFieldRef": {"containerName": "client", "resource": "limits.cpu", "divisor": "1"}
+                },
             }
         )
     mounts = [{"name": "tmp", "mountPath": "/tmp"}]
@@ -190,7 +222,7 @@ def job_manifest(args: argparse.Namespace, match_id: str, match_name: str, team:
         "containers": [
             {
                 "name": "client",
-                "image": args.image,
+                "image": image,
                 "imagePullPolicy": args.pull_policy,
                 "env": env,
                 "resources": {
@@ -249,11 +281,45 @@ def job_state(job: dict) -> str:
 
 
 def start_match(args: argparse.Namespace, n: int) -> None:
-    name = f"{args.match_prefix}-{datetime.now():%Y%m%d-%H%M%S}-m{n}"
+    name = match_name(args, n)
+    images = match_images(args, n)
     match_id = create_match(args, name)
     log(f"match {n}: created {name} ({match_id})")
+    if not args.dry_run:
+        safe_record(
+            match_id,
+            match_name=name,
+            created_at=datetime.now().astimezone().isoformat(timespec="seconds"),
+            namespace=args.namespace,
+            run_label=args.run_label,
+            teams={f"team{t}": {"image": images[t]} for t in (0, 1)},
+            status="running",
+        )
     for team in (0, 1):
-        kubectl(args, "create", "-f", "-", stdin=json.dumps(job_manifest(args, match_id, name, team)))
+        manifest = job_manifest(args, match_id, name, team, images[team])
+        kubectl(args, "create", "-f", "-", stdin=json.dumps(manifest))
+
+
+def safe_record(match_id: str, **info) -> None:
+    """versions.record_match, but a failure to write only warns: it must not stop self-play."""
+    try:
+        versions.record_match(match_id, **info)
+    except OSError as e:
+        log(f"warning: could not record versions of {match_id}: {e}")
+
+
+def pod_versions(args: argparse.Namespace, match_id: str) -> dict:
+    """{"team0": {"image_id", "node"}, ...} from the match's pods: the image each pod actually ran."""
+    out = json.loads(kubectl(args, "get", "pods", "-l", f"{MATCH_LABEL}={match_id}", "-o", "json"))
+    teams = {}
+    for pod in out["items"]:
+        team = pod["metadata"]["labels"].get(TEAM_LABEL)
+        statuses = pod.get("status", {}).get("containerStatuses") or []
+        if team is None or not statuses or not statuses[0].get("imageID"):
+            continue
+        image_id = statuses[0]["imageID"].rsplit("@", 1)[-1]  # some runtimes prefix the repository
+        teams[f"team{team}"] = {"image_id": image_id, "node": pod["spec"].get("nodeName")}
+    return teams
 
 
 def run(args: argparse.Namespace) -> int:
@@ -283,6 +349,18 @@ def run(args: argparse.Namespace) -> int:
                 consecutive_failures = 0 if ok else consecutive_failures + 1
                 teams = ", ".join(f"t{j['metadata']['labels'][TEAM_LABEL]}={s}" for j, s in zip(jobs, states))
                 log(f"match {match_id} {'finished' if ok else 'FAILED'} ({teams}); {finished} ok, {failed} failed")
+                try:
+                    ran = pod_versions(args, match_id)
+                except (subprocess.CalledProcessError, ValueError) as e:
+                    ran = {}
+                    log(f"warning: could not read the pods of {match_id}: {e}")
+                safe_record(
+                    match_id,
+                    teams=ran,
+                    status="finished" if ok else "failed",
+                    jobs={f"team{j['metadata']['labels'][TEAM_LABEL]}": s for j, s in zip(jobs, states)},
+                    ended_at=datetime.now().astimezone().isoformat(timespec="seconds"),
+                )
                 kubectl(args, "delete", "jobs", "-l", f"{MATCH_LABEL}={match_id}", "--wait=false")
             else:
                 running += 1
@@ -315,7 +393,14 @@ def main(argv: list[str] | None = None) -> int:
     env = os.environ.get
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--image", default=env("SELFPLAY_IMAGE"), help="client image, e.g. cnn-client:<tag>")
-    p.add_argument("--pull-policy", default="IfNotPresent", help="IfNotPresent works for images imported into containerd")
+    p.add_argument(
+        "--opponent-image",
+        default=env("SELFPLAY_OPPONENT_IMAGE"),
+        help="evaluation: play --image against this one, alternating sides; default: self-play",
+    )
+    p.add_argument(
+        "--pull-policy", default="IfNotPresent", help="IfNotPresent works for images imported into containerd"
+    )
     p.add_argument("--parallel", type=int, default=2, help="matches running at the same time (default 2)")
     p.add_argument("--gpu-per-client", type=int, default=2, help="nvidia.com/gpu slots per client (default 2)")
     p.add_argument("--matches", type=int, default=0, help="total matches to play; 0 = until stopped (default)")
@@ -327,14 +412,16 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--curl-image", default="curlimages/curl:8.17.0", help="image of the match-creating Job")
     p.add_argument("--team0-secret", default=env("SELFPLAY_TEAM0_SECRET"))
     p.add_argument("--team1-secret", default=env("SELFPLAY_TEAM1_SECRET"))
-    p.add_argument("--ca-configmap", default="", help="ConfigMap with key ca.crt, for an https server with a private CA")
+    p.add_argument(
+        "--ca-configmap", default="", help="ConfigMap with key ca.crt, for an https server with a private CA"
+    )
     p.add_argument("--runtime-class", default=env("SELFPLAY_RUNTIME_CLASS", "nvidia"), help="'' to omit")
     p.add_argument("--image-pull-secret", default=env("SELFPLAY_IMAGE_PULL_SECRET"))
     p.add_argument("--threads", type=int, default=0, help="search threads per client; 0 = all node CPUs")
     p.add_argument("--deadline", type=int, default=3600, help="activeDeadlineSeconds per client Job")
     p.add_argument("--poll", type=float, default=10, help="seconds between checks")
     p.add_argument("--max-consecutive-failures", type=int, default=3)
-    p.add_argument("--match-prefix", default="selfplay")
+    p.add_argument("--match-prefix", default="selfplay", help="match names: <prefix>-<image tag(s)>-<time>-m<n>")
     g = p.add_argument_group("game")
     # Defaults: the official 10-end setting (DigitalCurling3 wiki, server config v1.1 / GAT2023
     # regulation): 10 ends, 219 s per team, 21.9 s per extra end, fcv1, five-rock (FGZ) rule.
@@ -358,7 +445,7 @@ def main(argv: list[str] | None = None) -> int:
     }
     missing = [f"--{k.replace('_', '-')} ({v})" for k, v in required.items() if not getattr(args, k)]
     if missing:
-        p.error(f"missing settings, pass them or set them in .env: " + ", ".join(missing))
+        p.error("missing settings, pass them or set them in .env: " + ", ".join(missing))
     args.creator_secret = args.creator_secret or args.team0_secret
     return run(args)
 
