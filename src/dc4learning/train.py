@@ -1,6 +1,6 @@
 """Train the policy/score network on self-play samples (dc4learning.data build).
 
-    python -m dc4learning.train --data data/datasets/<name>.npz --init <traced.pt> --name gen1
+    python -m dc4learning.train --data data/datasets/<dataset>.npz --init data/models/best.pt --name gen1
     tensorboard --logdir runs        # watch it, http://localhost:6006
 
 Defaults follow the earlier DC3 training (digitalcurling-deeplearning): SGD lr 0.003, momentum 0.9,
@@ -8,7 +8,8 @@ weight decay 3e-4, batch 1024, fp16 autocast, loss = policy CE * --policy-weight
 
 Train/validation split is by match, so positions of one game never land on both sides.
 Every epoch writes to runs/<name>/: TensorBoard scalars, `checkpoint-NNN.pth` (to resume or
-compare), and `traced-NNN.pt`, a model the C++ client can load as-is.
+compare), and a model the C++ client can load as-is, named after its lineage (dc4learning.naming):
+`<gen>-e<epoch>-p<parent hash>-d<dataset hash>-<hash>.pt`, with a sidecar .json.
 """
 
 from __future__ import annotations
@@ -27,7 +28,19 @@ import torch.nn.functional as F
 from .config import runs_dir
 from .encoding import LEGAL_MASK, encode_batch
 from .model import PolicyValueNetwork, export, load
-from .versions import file_sha256
+from .naming import HASH, finalize, next_gen, parse, sha256
+
+
+def parent_model(init: Path | None) -> dict:
+    """{"file", "sha256"} of the model training starts from: a traced.pt (through any link), or the
+    export a checkpoint was saved with; {None, None} from scratch."""
+    if init is None:
+        return {"file": None, "sha256": None}
+    if init.suffix == ".pth":
+        ckpt = torch.load(init, map_location="cpu")
+        return {"file": ckpt.get("model_file"), "sha256": ckpt.get("model_sha256")}
+    real = init.resolve()
+    return {"file": real.name, "sha256": sha256(real)}
 
 
 def load_dataset(path: Path, device) -> dict[str, torch.Tensor]:
@@ -114,6 +127,11 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--data", required=True, type=Path, help="dataset .npz from `dc4learning.data build`")
     p.add_argument("--init", type=Path, help="start from a traced.pt or checkpoint-*.pth; default: random weights")
     p.add_argument("--name", default=None, help="run name (default: timestamp)")
+    p.add_argument(
+        "--gen",
+        default=None,
+        help="generation of the exports (default: the parent's + 1 from a model, the same from a checkpoint)",
+    )
     p.add_argument("--epochs", type=int, default=24)
     p.add_argument("--batch-size", type=int, default=1024)
     p.add_argument("--lr", type=float, default=0.003)
@@ -135,15 +153,36 @@ def main(argv: list[str] | None = None) -> int:
     name = args.name or datetime.now().strftime("%Y%m%d-%H%M%S")
     out = runs_dir() / name
     out.mkdir(parents=True, exist_ok=True)
-    # Lineage, read by `dc4learning.versions register-model`: the starting model and the games trained on.
-    run_info = {k: str(v) for k, v in vars(args).items()}
-    if args.init and args.init.suffix == ".pt":
-        run_info["init_sha256"] = file_sha256(args.init)
-    sidecar = args.data.with_suffix(".json")
-    if sidecar.exists():
-        meta = json.loads(sidecar.read_text())
-        run_info["dataset"] = {k: meta.get(k) for k in ("name", "filters", "samples", "matches", "played_by")}
+    # Lineage (dc4learning.naming): every export is named after its parent model and dataset.
+    parent = parent_model(args.init)
+    data_file = args.data.resolve()
+    data_hash = (parse(data_file.name) or {}).get("hash")
+    if not data_hash:
+        data_hash = sha256(data_file)[:HASH]
+        print(
+            f"warning: {data_file.name} is not a versioned dataset name; exports point to d{data_hash}", file=sys.stderr
+        )
+    data_meta_path = data_file.with_suffix(".json")
+    data_meta = json.loads(data_meta_path.read_text()) if data_meta_path.exists() else {}
+    # A new generation starts from an exported model; resuming a run's checkpoint keeps its generation.
+    if args.gen:
+        gen = args.gen
+    elif args.init and args.init.suffix == ".pth" and parse(parent["file"] or ""):
+        gen = parse(parent["file"])["gen"]
+    else:
+        gen = next_gen(parent["file"])
+    run_info = {
+        "args": {k: str(v) for k, v in vars(args).items()},
+        "gen": gen,
+        "parent": parent,
+        "dataset": {
+            "file": data_file.name,
+            "hash": data_hash,
+            **{k: data_meta.get(k) for k in ("samples", "played_by")},
+        },
+    }
     (out / "args.json").write_text(json.dumps(run_info, indent=1))
+    params = {k: v for k, v in vars(args).items() if k not in ("data", "init", "name", "device", "log_every")}
 
     data = load_dataset(args.data, device)
     train_idx, val_idx = split_by_match(data["match"], args.val_frac, args.seed, args.train_matches)
@@ -197,6 +236,24 @@ def main(argv: list[str] | None = None) -> int:
         writer.add_scalar("train/lr", opt.param_groups[0]["lr"], step)
         writer.add_scalar("train/epoch_seconds", time.monotonic() - t0, step)
         metrics = log_eval(epoch, step)
+        tmp = out / f".epoch-{epoch:03d}.tmp.pt"
+        export(model, tmp)
+        exported = finalize(
+            tmp,
+            f"{gen}-e{epoch:03d}-p{(parent['sha256'] or '0' * HASH)[:HASH]}-d{data_hash}",
+            ".pt",
+            {
+                "kind": "model",
+                "gen": gen,
+                "epoch": epoch,
+                "run": name,
+                "parent": parent,
+                "dataset": run_info["dataset"],
+                "params": params,
+                "metrics": metrics,
+            },
+        )
+        print(f"exported {exported.name}", file=sys.stderr)
         torch.save(
             {
                 "epoch": epoch,
@@ -205,10 +262,11 @@ def main(argv: list[str] | None = None) -> int:
                 "optimizer": opt.state_dict(),
                 "metrics": metrics,
                 "args": {k: str(v) for k, v in vars(args).items()},
+                "model_file": exported.name,
+                "model_sha256": sha256(exported),
             },
             out / f"checkpoint-{epoch:03d}.pth",
         )
-        export(model, out / f"traced-{epoch:03d}.pt")
         writer.flush()
     writer.close()
     print(f"done: {out}", file=sys.stderr)
