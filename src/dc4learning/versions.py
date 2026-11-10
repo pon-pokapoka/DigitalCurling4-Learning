@@ -7,14 +7,16 @@ Three identities:
   - model: sha256 of the `traced.pt` inside the image. The CNN repo doesn't track its model
     files, so the commit alone doesn't say which model an image runs.
 
-Model files: a versioned original, `<generation>-<first 8 hex digits of sha256>.pt` (e.g.
-`gen0-588f425c.pt`), and links with the names its users expect: `traced.pt` in the CNN repo,
-`data/models/best.pt` (the current champion) here. Promoting a model is repointing the link.
+File names record lineage (dc4learning.naming): a model is
+`<gen>-e<epoch>-p<parent hash>-d<dataset hash>-<hash>.pt` with a sidecar .json, and is used through
+links with the names its users expect: `traced.pt` in the CNN repo, `data/models/best.pt` (the
+current champion) here. Promoting a model is repointing the link.
 
 Records, under `config.data_dir()/versions` (not committed):
     images.json            image ID -> refs, client commit, model sha256, built from
     models.json            model sha256 -> name, source, parent model, training dataset
-    matches/<id>.json      per match: each team's image (ref and the ID the pod ran)
+    matches/<id>.json      older matches only: each team's image (new matches carry their version ID
+                           in the server's match and tournament names instead)
 
 Images built with scripts/client-image.sh or scripts/model-image.sh carry the same facts as labels
 (`LABEL_*`), so `register-image` can read them back from any copy of the image.
@@ -22,7 +24,8 @@ Images built with scripts/client-image.sh or scripts/model-image.sh carry the sa
     python -m dc4learning.versions list                         # images and models
     python -m dc4learning.versions show <match_id>              # what played a match
     python -m dc4learning.versions register-image cnn-client:<tag> [--client-commit C] [--model-name N]
-    python -m dc4learning.versions register-model runs/<run>/traced-NNN.pt [--name N]
+    python -m dc4learning.versions trace data/models/best.pt     # model -> parent -> ..., datasets
+    python -m dc4learning.versions register-model <model.pt> [--name N]
     python -m dc4learning.versions name-model <sha256 prefix> <name>
 """
 
@@ -31,12 +34,14 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import re
 import subprocess
 import sys
 from datetime import UTC, datetime
 from pathlib import Path
 
-from .config import data_dir
+from .config import data_dir, runs_dir
+from .naming import parse, trace
 
 LABEL_CLIENT = "org.opencontainers.image.revision"
 LABEL_MODEL_SHA = "io.github.dc4learning.model.sha256"
@@ -111,19 +116,26 @@ def register_model(sha: str, **info) -> dict:
 
 
 def register_trained_model(path: str | Path, name: str | None = None) -> tuple[str, dict]:
-    """Record a `traced.pt`; if it is a training export (runs/<run>/traced-NNN.pt), with its lineage."""
+    """Record a model file; its lineage comes from its sidecar (dc4learning.naming), if it has one."""
     path = Path(path)
-    sha = file_sha256(path)
-    real = path.resolve()  # e.g. data/models/best.pt -> gen1-1a2b3c4d.pt: record the versioned file
-    info: dict = {"name": name, "source": str(real)}
-    run_info_path = real.parent / "args.json"
-    if run_info_path.exists():
-        run = json.loads(run_info_path.read_text())
-        info["run"] = path.parent.name
-        info["epoch"] = path.stem.rsplit("-", 1)[-1]
-        info["parent"] = run.get("init_sha256")
-        info["init"] = run.get("init")
-        info["dataset"] = run.get("dataset")
+    real = path.resolve()  # e.g. data/models/best.pt -> the versioned file
+    sha = file_sha256(real)
+    fields = parse(real.name) or {}
+    info: dict = {"name": name or fields.get("gen"), "source": real.name}
+    sidecar = real.with_suffix(".json")
+    if sidecar.exists():
+        meta = json.loads(sidecar.read_text())
+        info.update(
+            {
+                "file": meta.get("file"),
+                "run": meta.get("run"),
+                "epoch": meta.get("epoch"),
+                "parent": (meta.get("parent") or {}).get("sha256"),
+                "init": (meta.get("parent") or {}).get("file"),
+                "dataset": meta.get("dataset"),
+                "code": meta.get("code"),
+            }
+        )
     return sha, register_model(sha, **info)
 
 
@@ -214,11 +226,35 @@ def match_record(match_id: str) -> dict | None:
     return json.loads(path.read_text()) if path.exists() else None
 
 
+VERSION_ID_RE = re.compile(r"^(?P<client>[0-9a-z]+)\.(?P<model>[0-9a-z]+)\.(?P<hash>[0-9a-f]{8})$")
+
+
+def version_id(ref: str) -> str | None:
+    """`<client commit>.<model>.<model hash>` of a recorded image, e.g. a604b03.gen0.588f425c.
+
+    This is what match and tournament names carry, so the server's database alone says what
+    played each match. None if the image isn't recorded (see register-image)."""
+    _, rec = image_by_ref(ref)
+    if not rec or not rec.get("client_commit") or not rec.get("model_sha256"):
+        return None
+    sha = rec["model_sha256"]
+    return f"{rec['client_commit']}.{model_label(sha)}.{sha[:8]}"
+
+
+def parse_version_id(text: str | None) -> dict | None:
+    """{"client", "model", "model_sha256"} from a version ID (full sha256 if the model is recorded)."""
+    m = VERSION_ID_RE.match(text or "")
+    if not m:
+        return None
+    sha = next((s for s in models() if s.startswith(m["hash"])), m["hash"])
+    return {"client": m["client"], "model": m["model"], "model_sha256": sha}
+
+
 def match_versions(match_id: str, match_name: str | None = None) -> dict[str, dict]:
     """{"team0": team_version, "team1": team_version} for a match.
 
-    From the match record if dc4learning.selfplay wrote one, else from the image tags in the
-    match name (resolved through images.json), else unknown.
+    From the match record if dc4learning.selfplay wrote one, else from the match name: a version ID
+    (`<client>.<model>.<hash>`, see `version_id`) or an image tag resolved through images.json.
     """
     rec = match_record(match_id) or {}
     teams = rec.get("teams") or {}
@@ -230,6 +266,10 @@ def match_versions(match_id: str, match_name: str | None = None) -> dict[str, di
             from .data import images_from_name
 
             tag = images_from_name(match_name)[0 if t == "team0" else 1]
+            parsed = parse_version_id(tag)
+            if parsed and not image_id:
+                out[t] = {"image": None, "image_id": None, **parsed}
+                continue
             if tag:
                 ref = next((r for rec in images().values() for r in rec["refs"] if r.endswith(":" + tag)), None)
         out[t] = team_version(ref, image_id)
@@ -267,6 +307,8 @@ def main(argv: list[str] | None = None) -> int:
     r.add_argument("--client-commit")
     r.add_argument("--model-name")
     r.add_argument("--model-source")
+    t = sub.add_parser("trace", help="follow a model, dataset or win table back through its file names")
+    t.add_argument("path")
     m = sub.add_parser("register-model", help="record a traced.pt, with its training lineage if it has one")
     m.add_argument("path")
     m.add_argument("--name")
@@ -281,6 +323,9 @@ def main(argv: list[str] | None = None) -> int:
     elif args.cmd == "register-image":
         image_id, rec = register_image(args.ref, args.client_commit, args.model_name, args.model_source)
         print(f"{args.ref}: {image_id[:19]} client {rec.get('client_commit')} model {model_label(rec['model_sha256'])}")
+    elif args.cmd == "trace":
+        roots = [data_dir() / "models", data_dir() / "datasets", data_dir() / "tables", runs_dir()]
+        print("\n".join(trace(args.path, roots)))
     elif args.cmd == "register-model":
         sha, rec = register_trained_model(args.path, args.name)
         print(f"{sha} {rec.get('name') or ''}")
