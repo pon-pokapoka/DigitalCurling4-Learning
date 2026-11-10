@@ -86,7 +86,9 @@ Cluster-specific settings have no defaults; they come from options, environment 
 uncommitted `.env`. No credentials pass through the machine running the loop: each match is
 created by a short Job with `curlimages/curl` that logs in with a Secret, and the loop itself only needs
 kubectl access to the namespace. Game defaults are the official 10-end setting (DigitalCurling3 wiki:
-219 s per team, 21.9 s per extra end, fcv1, five-rock rule).
+219 s per team, 21.9 s per extra end, fcv1, five-rock rule). `SELFPLAY_CLIENT_ENV` adds environment variables to the clients
+(`KEY=VALUE[,KEY=VALUE...]`); `DC_TEAM_NAME_FULL=1` makes clients from DigitalCurling4-CNN #33 on
+send a team name with their build ID and model and table hashes, which the server records.
 
 The namespace needs one Secret per team (keys `auth-id`, `auth-pw`) and the client image on the GPU
 node (`imagePullPolicy: IfNotPresent`, so an image imported into containerd works). Pods use
