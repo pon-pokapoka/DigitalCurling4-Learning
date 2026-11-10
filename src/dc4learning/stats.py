@@ -1,8 +1,8 @@
 """Self-play status and results.
 
-    python -m dc4learning.stats              # download new matches, then report
-    python -m dc4learning.stats --no-sync    # report on what is already downloaded
-    watch -n 300 python -m dc4learning.stats # refresh every 5 minutes
+    python -m dc4learning.stats                         # all self-play games on the server
+    python -m dc4learning.stats --since 2026-11-10T10:03
+    watch -n 300 python -m dc4learning.stats            # refresh every 5 minutes
 
 Reports the matches running on the cluster (when SELFPLAY_NAMESPACE is set and kubectl works),
 throughput, and per pairing of versions (client commit / model, see dc4learning.versions): games,
@@ -22,7 +22,7 @@ from datetime import UTC, datetime
 import pandas as pd
 
 from .config import load_env
-from .data import load_index, sync
+from .data import games
 
 
 def cluster_status() -> str | None:
@@ -72,9 +72,20 @@ def pairing_table(index: pd.DataFrame) -> pd.DataFrame:
         a, b = version(m, 0), version(m, 1)
         key = tuple(sorted((a, b)))
         r = rows.setdefault(
-            key, {"A": key[0], "B": key[1], "games": 0, "A wins": 0, "B wins": 0, "draws": 0, "first team wins": 0}
+            key,
+            {
+                "A": key[0],
+                "B": key[1],
+                "games": 0,
+                "A wins": 0,
+                "B wins": 0,
+                "draws": 0,
+                "first team wins": 0,
+                "time losses": 0,
+            },
         )
         r["games"] += 1
+        r["time losses"] += bool(m.get("time_loss"))
         if m["winner"] is None:
             r["draws"] += 1
             continue
@@ -101,19 +112,21 @@ def pairing_table(index: pd.DataFrame) -> pd.DataFrame:
 def report(index: pd.DataFrame) -> str:
     if index.empty:
         return "no finished matches downloaded yet"
+    excluded = int(index["interrupted"].sum()) if "interrupted" in index else 0
+    index = index[~index["interrupted"].astype(bool)] if "interrupted" in index else index
     now = pd.Timestamp.now(tz="UTC").tz_localize(None)  # the server's times are naive UTC
     finished = index["finished_at"]
     last_hour = (finished >= now - pd.Timedelta(hours=1)).sum()
     durations = (index["finished_at"] - index["started_at"]).dt.total_seconds() / 60
     lines = [
-        f"matches: {len(index)} finished, {last_hour} in the last hour, last at {finished.max():%Y-%m-%d %H:%M} UTC",
+        f"matches: {len(index)} finished, {last_hour} in the last hour, last at {finished.max():%Y-%m-%d %H:%M} UTC"
+        + (f" ({excluded} interrupted, left out)" if excluded else ""),
+        f"time losses: {index['time_loss'].mean():.0%} of games ended with a side out of time"
+        if "time_loss" in index
+        else "",
         (
             f"game: {index['ends_played'].mean():.2f} ends on average, {(index['extra_ends'] > 0).mean():.1%} with an extra end,"
             f" {durations.median():.1f} min median, {(index['winner'].isna()).sum()} draws"
-        ),
-        (
-            f"time left at the end (median s): first team {index['time_left0'].median():.0f},"
-            f" second team {index['time_left1'].median():.0f}"
         ),
         "",
         pairing_table(index).to_string(index=False),
@@ -123,11 +136,11 @@ def report(index: pd.DataFrame) -> str:
 
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--no-sync", action="store_true", help="don't download new matches first")
-    p.add_argument("--prefix", default="selfplay-")
+    p.add_argument("--prefix", default="selfplay-", help="match name prefix")
+    p.add_argument("--since", help="only matches started at or after this time (UTC), e.g. 2026-11-10T10:03")
     args = p.parse_args(argv)
     load_env()
-    index = load_index() if args.no_sync else sync(args.prefix)
+    index = games(args.prefix, args.since)
     status = cluster_status()
     if status:
         print(status + "\n")
