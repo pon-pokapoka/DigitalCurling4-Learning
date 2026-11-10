@@ -12,6 +12,9 @@ dependencies = [
     # Must match the libtorch in DigitalCurling4-CNN (2.15.0+cu134) so exported
     # models load in the C++ client. Bump both repos together.
     "torch==2.15.0",
+    "pyarrow>=26.0.1",
+    "tensorboard>=2.21.0",
+    "scipy>=1.18.1",
 ]
 
 [dependency-groups]
