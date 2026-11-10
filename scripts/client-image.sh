@@ -46,7 +46,12 @@ cp "$model" "$cnn/src/engine/model/win_table.csv" "$ctx/src/engine/model/"
 
 sha="$(versions register-model "$model" ${model_name:+--name "$model_name"} | cut -d' ' -f1)"
 echo "building $image from $commit (model ${sha:0:12}); the first build takes a while" >&2
+# The build has no .git (git archive), so pass the client its build ID, as `git describe` names
+# the commit (e.g. v2026.07-70-gddff1ad). Ignored by clients older than DigitalCurling4-CNN #33.
+build_id="$(git -C "$cnn" describe --tags --always "$commit")"
 docker build -q -t "$image" \
+  --build-arg "BUILD_ID=$build_id" \
+  --label "io.github.dc4learning.client.build-id=$build_id" \
   --label "org.opencontainers.image.revision=$commit" \
   --label "io.github.dc4learning.model.sha256=$sha" \
   ${model_name:+--label "io.github.dc4learning.model.name=$model_name"} \
