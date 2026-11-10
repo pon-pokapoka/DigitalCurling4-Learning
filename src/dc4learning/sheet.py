@@ -46,9 +46,7 @@ def draw_stones(ax, stone_json: dict, label: bool = True, highlight: tuple[str, 
     for team in ["team0", "team1"]:
         for i, x, y in stones_xy(stone_json, team):
             lw = 1.8 if highlight == (team, i) else 0.6
-            ax.add_patch(
-                plt.Circle((x, y), STONE_R, facecolor=TEAM_COLOR[team], edgecolor=EDGE, lw=lw, zorder=3)
-            )
+            ax.add_patch(plt.Circle((x, y), STONE_R, facecolor=TEAM_COLOR[team], edgecolor=EDGE, lw=lw, zorder=3))
             if label:
                 ax.text(x, y, str(i), ha="center", va="center", fontsize=6, color=EDGE, zorder=4)
 

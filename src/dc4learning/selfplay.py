@@ -23,12 +23,14 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import signal
 import subprocess
 import sys
 import time
 from datetime import datetime
 
+from . import versions
 from .config import load_env
 
 SELFPLAY_LABEL = "dc4learning/selfplay"
@@ -65,7 +67,8 @@ def create_match(args: argparse.Namespace, name: str) -> str:
         "match_name": name,
         "positioned_stones_pattern": args.positioned_pattern,
     }
-    job_name = "create-" + name.lower()[-50:].strip("-")
+    # A valid Job name: lowercase alphanumerics and dashes, at most 63 characters.
+    job_name = "create-" + re.sub(r"[^a-z0-9-]+", "-", name.lower())[-50:].strip("-")
     labels = {SELFPLAY_LABEL + "-creator": args.run_label, CREATOR_LABEL: "true"}
     secret = args.creator_secret
     job = {
@@ -95,8 +98,14 @@ def create_match(args: argparse.Namespace, name: str) -> str:
                             "env": [
                                 {"name": "DC_HOST", "value": args.server_url.rstrip("/")},
                                 {"name": "PAYLOAD", "value": json.dumps(payload)},
-                                {"name": "DC_AUTH_ID", "valueFrom": {"secretKeyRef": {"name": secret, "key": "auth-id"}}},
-                                {"name": "DC_AUTH_PW", "valueFrom": {"secretKeyRef": {"name": secret, "key": "auth-pw"}}},
+                                {
+                                    "name": "DC_AUTH_ID",
+                                    "valueFrom": {"secretKeyRef": {"name": secret, "key": "auth-id"}},
+                                },
+                                {
+                                    "name": "DC_AUTH_PW",
+                                    "valueFrom": {"secretKeyRef": {"name": secret, "key": "auth-pw"}},
+                                },
                             ],
                             "resources": {"requests": {"cpu": "10m", "memory": "16Mi"}, "limits": {"memory": "64Mi"}},
                             "securityContext": {
@@ -145,7 +154,44 @@ def kubectl(args: argparse.Namespace, *cmd: str, stdin: str | None = None) -> st
     return subprocess.run(full, input=stdin, capture_output=True, text=True, check=True).stdout
 
 
-def job_manifest(args: argparse.Namespace, match_id: str, match_name: str, team: int) -> dict:
+def image_tag(image: str) -> str:
+    """Short label of an image for match names: its tag (or name), without dashes."""
+    tag = image.rsplit("/", 1)[-1]
+    tag = tag.split(":", 1)[1] if ":" in tag else tag
+    return tag.replace("-", "_")
+
+
+def match_images(args: argparse.Namespace, n: int) -> tuple[str, str]:
+    """(team0 image, team1 image) of match n. With an opponent, the sides alternate."""
+    if not args.opponent_image:
+        return args.image, args.image
+    return (args.image, args.opponent_image) if n % 2 else (args.opponent_image, args.image)
+
+
+def version_label(image: str) -> str:
+    """What a match name says about a team: its version ID (`<client>.<model>.<model hash>`,
+    from the version records) or, for an unrecorded image, its tag."""
+    return versions.version_id(image) or image_tag(image)
+
+
+def match_name(args: argparse.Namespace, n: int) -> str:
+    """<prefix>-<version>-<ts>-m<n>, or <prefix>-<team0 version>-vs-<team1 version>-<ts>-m<n>.
+
+    The server stores the name, so its database records what played each match; dc4learning.data
+    and dc4learning.versions read it back."""
+    a, b = (version_label(i) for i in match_images(args, n))
+    teams = a if a == b else f"{a}-vs-{b}"
+    return f"{args.match_prefix}-{teams}-{datetime.now():%Y%m%d-%H%M%S}-m{n}"
+
+
+def default_tournament(args: argparse.Namespace) -> str:
+    """One tournament per run: selfplay-<version>, or eval-<candidate>-vs-<opponent> (sides alternate)."""
+    if args.opponent_image:
+        return f"eval-{version_label(args.image)}-vs-{version_label(args.opponent_image)}"
+    return f"{args.match_prefix}-{version_label(args.image)}"
+
+
+def job_manifest(args: argparse.Namespace, match_id: str, match_name: str, team: int, image: str) -> dict:
     labels = {
         "app.kubernetes.io/name": "cnn-client",
         "app.kubernetes.io/component": "client",
@@ -168,7 +214,9 @@ def job_manifest(args: argparse.Namespace, match_id: str, match_name: str, team:
         env.append(
             {
                 "name": "DC_CLIENT_THREADS",
-                "valueFrom": {"resourceFieldRef": {"containerName": "client", "resource": "limits.cpu", "divisor": "1"}},
+                "valueFrom": {
+                    "resourceFieldRef": {"containerName": "client", "resource": "limits.cpu", "divisor": "1"}
+                },
             }
         )
     mounts = [{"name": "tmp", "mountPath": "/tmp"}]
@@ -190,7 +238,7 @@ def job_manifest(args: argparse.Namespace, match_id: str, match_name: str, team:
         "containers": [
             {
                 "name": "client",
-                "image": args.image,
+                "image": image,
                 "imagePullPolicy": args.pull_policy,
                 "env": env,
                 "resources": {
@@ -249,11 +297,16 @@ def job_state(job: dict) -> str:
 
 
 def start_match(args: argparse.Namespace, n: int) -> None:
-    name = f"{args.match_prefix}-{datetime.now():%Y%m%d-%H%M%S}-m{n}"
+    name = match_name(args, n)
+    images = match_images(args, n)
     match_id = create_match(args, name)
-    log(f"match {n}: created {name} ({match_id})")
+    if args.verbose or args.dry_run:
+        log(f"match {n}: created {name} ({match_id})")
+    # Nothing is stored locally per match: the server's match and tournament names carry each
+    # team's version ID (see version_label), and its database holds everything else.
     for team in (0, 1):
-        kubectl(args, "create", "-f", "-", stdin=json.dumps(job_manifest(args, match_id, name, team)))
+        manifest = job_manifest(args, match_id, name, team, images[team])
+        kubectl(args, "create", "-f", "-", stdin=json.dumps(manifest))
 
 
 def run(args: argparse.Namespace) -> int:
@@ -282,7 +335,8 @@ def run(args: argparse.Namespace) -> int:
                 failed += not ok
                 consecutive_failures = 0 if ok else consecutive_failures + 1
                 teams = ", ".join(f"t{j['metadata']['labels'][TEAM_LABEL]}={s}" for j, s in zip(jobs, states))
-                log(f"match {match_id} {'finished' if ok else 'FAILED'} ({teams}); {finished} ok, {failed} failed")
+                if args.verbose or not ok:  # the server records every finished game; log only failures
+                    log(f"match {match_id} {'finished' if ok else 'FAILED'} ({teams}); {finished} ok, {failed} failed")
                 kubectl(args, "delete", "jobs", "-l", f"{MATCH_LABEL}={match_id}", "--wait=false")
             else:
                 running += 1
@@ -315,7 +369,14 @@ def main(argv: list[str] | None = None) -> int:
     env = os.environ.get
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--image", default=env("SELFPLAY_IMAGE"), help="client image, e.g. cnn-client:<tag>")
-    p.add_argument("--pull-policy", default="IfNotPresent", help="IfNotPresent works for images imported into containerd")
+    p.add_argument(
+        "--opponent-image",
+        default=env("SELFPLAY_OPPONENT_IMAGE"),
+        help="evaluation: play --image against this one, alternating sides; default: self-play",
+    )
+    p.add_argument(
+        "--pull-policy", default="IfNotPresent", help="IfNotPresent works for images imported into containerd"
+    )
     p.add_argument("--parallel", type=int, default=2, help="matches running at the same time (default 2)")
     p.add_argument("--gpu-per-client", type=int, default=2, help="nvidia.com/gpu slots per client (default 2)")
     p.add_argument("--matches", type=int, default=0, help="total matches to play; 0 = until stopped (default)")
@@ -327,25 +388,32 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--curl-image", default="curlimages/curl:8.17.0", help="image of the match-creating Job")
     p.add_argument("--team0-secret", default=env("SELFPLAY_TEAM0_SECRET"))
     p.add_argument("--team1-secret", default=env("SELFPLAY_TEAM1_SECRET"))
-    p.add_argument("--ca-configmap", default="", help="ConfigMap with key ca.crt, for an https server with a private CA")
+    p.add_argument(
+        "--ca-configmap", default="", help="ConfigMap with key ca.crt, for an https server with a private CA"
+    )
     p.add_argument("--runtime-class", default=env("SELFPLAY_RUNTIME_CLASS", "nvidia"), help="'' to omit")
     p.add_argument("--image-pull-secret", default=env("SELFPLAY_IMAGE_PULL_SECRET"))
     p.add_argument("--threads", type=int, default=0, help="search threads per client; 0 = all node CPUs")
     p.add_argument("--deadline", type=int, default=3600, help="activeDeadlineSeconds per client Job")
     p.add_argument("--poll", type=float, default=10, help="seconds between checks")
     p.add_argument("--max-consecutive-failures", type=int, default=3)
-    p.add_argument("--match-prefix", default="selfplay")
+    p.add_argument(
+        "--match-prefix",
+        default=None,
+        help="match names: <prefix>-<version(s)>-<time>-m<n> (default: selfplay or eval)",
+    )
     g = p.add_argument_group("game")
     # Defaults: the official 10-end setting (DigitalCurling3 wiki, server config v1.1 / GAT2023
     # regulation): 10 ends, 219 s per team, 21.9 s per extra end, fcv1, five-rock (FGZ) rule.
     g.add_argument("--game-mode", default="standard")
-    g.add_argument("--tournament", default="self-play")
+    g.add_argument("--tournament", default=None, help="default: selfplay-<version> or eval-<candidate>-vs-<opponent>")
     g.add_argument("--simulator", default="fcv1")
     g.add_argument("--applied-rule", default="fgz_rule")
     g.add_argument("--time-limit", type=float, default=219, help="seconds per team for the standard ends")
     g.add_argument("--extra-end-time-limit", type=float, default=21.9, help="seconds per team per extra end")
     g.add_argument("--end-count", type=int, default=10)
     g.add_argument("--positioned-pattern", type=int, default=0)
+    p.add_argument("--verbose", action="store_true", help="also log every match start and finish")
     p.add_argument("--dry-run", action="store_true", help="print one match's Job manifests and exit")
     args = p.parse_args(argv)
 
@@ -358,8 +426,10 @@ def main(argv: list[str] | None = None) -> int:
     }
     missing = [f"--{k.replace('_', '-')} ({v})" for k, v in required.items() if not getattr(args, k)]
     if missing:
-        p.error(f"missing settings, pass them or set them in .env: " + ", ".join(missing))
+        p.error("missing settings, pass them or set them in .env: " + ", ".join(missing))
     args.creator_secret = args.creator_secret or args.team0_secret
+    args.match_prefix = args.match_prefix or ("eval" if args.opponent_image else "selfplay")
+    args.tournament = args.tournament or default_tournament(args)
     return run(args)
 
 

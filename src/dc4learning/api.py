@@ -7,6 +7,8 @@ from __future__ import annotations
 
 import json
 import os
+import time
+import urllib.error
 import urllib.parse
 import urllib.request
 
@@ -26,20 +28,31 @@ SHOT_COLS = [
 
 
 class DC4Client:
-    def __init__(self, base_url: str | None = None, timeout: float = 30):
+    def __init__(self, base_url: str | None = None, timeout: float = 30, retries: int = 4):
         load_env()
         base_url = base_url or os.environ.get("DC_SERVER_URL")
         if not base_url:
             raise ValueError("Pass base_url or set DC_SERVER_URL (environment or the repo's .env)")
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
+        self.retries = retries
 
     def get(self, path: str, **params):
+        """GET and decode JSON. Server errors (5xx) and dropped connections are retried with backoff."""
         url = self.base_url + path
         if params:
             url += "?" + urllib.parse.urlencode(params)
-        with urllib.request.urlopen(url, timeout=self.timeout) as r:
-            return json.load(r)
+        for attempt in range(self.retries + 1):
+            try:
+                with urllib.request.urlopen(url, timeout=self.timeout) as r:
+                    return json.load(r)
+            except urllib.error.HTTPError as e:
+                if e.code < 500 or attempt == self.retries:
+                    raise
+            except (urllib.error.URLError, ConnectionError, TimeoutError):
+                if attempt == self.retries:
+                    raise
+            time.sleep(min(30, 2**attempt))
 
     def list_matches(self) -> pd.DataFrame:
         """All matches in all tournaments, newest first."""

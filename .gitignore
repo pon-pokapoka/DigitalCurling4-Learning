@@ -16,3 +16,4 @@ runs/
 
 # Local settings (server, cluster)
 .env
+logs/

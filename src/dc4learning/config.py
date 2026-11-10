@@ -21,6 +21,27 @@ def find_env_file(start: Path | None = None) -> Path | None:
     return None
 
 
+def repo_root() -> Path:
+    """Directory with pyproject.toml, from the current directory upwards (else the current directory)."""
+    cwd = Path.cwd().resolve()
+    for d in [cwd, *cwd.parents]:
+        if (d / "pyproject.toml").is_file():
+            return d
+    return cwd
+
+
+def data_dir() -> Path:
+    """Where downloaded logs and datasets go: DC4_DATA_DIR, default <repo>/data (not committed)."""
+    load_env()
+    return Path(os.environ.get("DC4_DATA_DIR") or repo_root() / "data")
+
+
+def runs_dir() -> Path:
+    """Training runs (TensorBoard logs, checkpoints, exported models): DC4_RUNS_DIR, default <repo>/runs."""
+    load_env()
+    return Path(os.environ.get("DC4_RUNS_DIR") or repo_root() / "runs")
+
+
 def load_env() -> Path | None:
     """Load the nearest `.env` into os.environ once; return its path, if any."""
     global _loaded
@@ -29,8 +50,7 @@ def load_env() -> Path | None:
         return path
     for line in path.read_text().splitlines():
         line = line.strip()
-        if line.startswith("export "):
-            line = line[len("export ") :]
+        line = line.removeprefix("export ")
         if line and not line.startswith("#") and "=" in line:
             key, value = line.split("=", 1)
             os.environ.setdefault(key.strip(), value.strip().strip("'\""))
