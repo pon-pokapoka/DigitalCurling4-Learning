@@ -192,9 +192,12 @@ def select_matches(
     since: str | None = None,
     include_interrupted: bool = False,
     include_time_losses: bool = True,
+    until: str | None = None,
+    last: int = 0,
 ) -> pd.DataFrame:
-    """Matches where both teams match the filters: `model` is a model name or sha256 prefix,
-    `client` a client commit, `image` an image tag; `since` a start time.
+    """Matches where both teams match the filters: `model` is a model name or sha256 prefix, or
+    several separated by commas (each team plays one of them), `client` a client commit, `image` an
+    image tag; `since` / `until` bound the start time (until: exclusive); `last` keeps the newest N.
     Interrupted matches are left out, and games lost on time too if `include_time_losses` is False
     (see `games`)."""
     if not include_interrupted and "interrupted" in index:
@@ -206,13 +209,19 @@ def select_matches(
     if client:
         index = index[(index["client0"] == client) & (index["client1"] == client)]
     if model:
+        models = [m.strip() for m in model.split(",") if m.strip()]
 
         def is_model(t):
-            return (index[f"model{t}"] == model) | index[f"model_sha256{t}"].fillna("").str.startswith(model)
+            sha = index[f"model_sha256{t}"].fillna("")
+            return index[f"model{t}"].isin(models) | sha.apply(lambda h: any(h.startswith(m) for m in models))
 
         index = index[is_model(0) & is_model(1)]
     if since:
         index = index[index["started_at"] >= pd.Timestamp(since)]
+    if until:
+        index = index[index["started_at"] < pd.Timestamp(until)]
+    if last:
+        index = index.sort_values("started_at").tail(last)
     return index
 
 
@@ -243,6 +252,8 @@ def build_dataset(
     root: Path | None = None,
     model: str | None = None,
     client: str | None = None,
+    until: str | None = None,
+    last: int = 0,
 ) -> Path:
     """Samples of finished matches (read from the server) where both teams match the filters.
 
@@ -250,7 +261,7 @@ def build_dataset(
     match IDs, the versions that played them, and the commit of this code (dc4learning.naming).
     """
     root = root or data_dir()
-    index = select_matches(games(since=since), image, model, client)
+    index = select_matches(games(since=since), image, model, client, until=until, last=last)
     selection = slug(selection or selection_label("selfplay", image, model, client, since))
     cols = {k: [] for k in ("pixels", "shot", "policy", "score", "end", "team", "won", "match")}
     for i, match_id in enumerate(index["match_id"]):
@@ -279,7 +290,7 @@ def build_dataset(
         ".npz",
         {
             "kind": "dataset",
-            "params": {"image": image, "model": model, "client": client, "since": since},
+            "params": {"image": image, "model": model, "client": client, "since": since, "until": until, "last": last},
             "samples": len(arrays["shot"]),
             "played_by": played_by(index),
             "match_ids": index["match_id"].tolist(),
@@ -300,11 +311,15 @@ def main(argv: list[str] | None = None) -> int:
     b = sub.add_parser("build", help="build a training dataset from finished matches on the server")
     b.add_argument("--selection", default=None, help="name part before -n<matches> (default: from the filters)")
     b.add_argument("--image", help="only matches where both teams used this client image (tag)")
-    b.add_argument("--model", help="only matches where both teams used this model (name or sha256 prefix)")
+    b.add_argument("--model", help="only matches where both teams used this model (name or sha256 prefix; several: comma-separated)")
     b.add_argument("--client", help="only matches where both teams used this client commit")
     b.add_argument("--since", help="only matches started at or after this time, e.g. 2026-11-09T02:30")
+    b.add_argument("--until", help="only matches started before this time")
+    b.add_argument("--last", type=int, default=0, help="keep only the newest N matches after the other filters")
     args = p.parse_args(argv)
-    build_dataset(args.selection, args.image, args.since, model=args.model, client=args.client)
+    build_dataset(
+        args.selection, args.image, args.since, model=args.model, client=args.client, until=args.until, last=args.last
+    )
     return 0
 
 
