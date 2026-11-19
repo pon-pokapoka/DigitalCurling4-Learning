@@ -7,6 +7,7 @@
 # The image is the client image in BASE_IMAGE (default SELFPLAY_IMAGE) with its model replaced,
 # tagged <name of the base image>:<tag>, default <base tag>_<gen>-<model hash>
 # (e.g. cnn-client:a604b03_gen1-3f2a9c1d). Same client binary and win table, only traced.pt differs.
+# The base may be in a registry (e.g. registry.example/cnn-client:v26.11.0); it is pulled if needed.
 # The model name defaults to the generation in the file name (dc4learning.naming).
 #
 # The model file and its sidecar .json are kept in data/models under their versioned name (a model
@@ -15,13 +16,15 @@
 # export its run, starting model and training games) and the image. The image also carries these as
 # labels, so they travel with it.
 #
-# If IMAGE_IMPORT_CMD is set (environment or the repo's .env), the image is piped into it as a
-# `docker save` tarball, e.g. IMAGE_IMPORT_CMD='sudo ctr -n k8s.io images import -'.
-# Then evaluate it: python -m dc4learning.selfplay --opponent-image <name>:<tag> --matches 100
+# If IMAGE_REGISTRY is set (environment or the repo's .env), the image is pushed there as
+# <registry>/<name>:<tag> (docker login first). Otherwise, if IMAGE_IMPORT_CMD is set, it is piped
+# into it as a `docker save` tarball, e.g. IMAGE_IMPORT_CMD='sudo ctr -n k8s.io images import -'.
+# The last line printed is the reference to give the pods; evaluate it with
+# python -m dc4learning.selfplay --opponent-image <that reference> --matches 100
 set -euo pipefail
 
 if [[ $# -lt 1 || $# -gt 3 ]]; then
-  sed -n '2,20p' "$0" >&2
+  sed -n '2,23p' "$0" >&2
   exit 1
 fi
 model="$(readlink -f "$1")"   # the versioned file behind any link
@@ -38,6 +41,7 @@ source "$repo_root/scripts/lib.sh"
 base="${BASE_IMAGE:-${SELFPLAY_IMAGE:-}}"
 [[ -n "$base" ]] || { echo "Set BASE_IMAGE or SELFPLAY_IMAGE to the client image to start from." >&2; exit 1; }
 [[ -f "$model" ]] || { echo "No model file: $model" >&2; exit 1; }
+use_base_image "$base"
 
 # The model, with its lineage if it is a training export.
 sha="$(versions register-model "$model" --name "$model_name" | cut -d' ' -f1)"
@@ -71,5 +75,5 @@ docker build -q -t "$image" \
   --label "io.github.dc4learning.model.source=$model_file" \
   --label "io.github.dc4learning.parent-image=$base" \
   "$ctx" >/dev/null
-versions register-image "$image" ${client:+--client-commit "$client"}
-import_image "$image"
+versions register-image "$image" ${client:+--client-commit "$client"} >&2
+publish_image "$image"

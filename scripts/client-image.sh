@@ -13,12 +13,14 @@
 #
 # Recorded in data/versions (dc4learning.versions): the client commit, the model's sha256 and name,
 # and the image ID. The image carries the same facts as labels.
-# If IMAGE_IMPORT_CMD is set (environment or the repo's .env), the image is loaded with it,
-# e.g. IMAGE_IMPORT_CMD='sudo ctr -n k8s.io images import -'.
+# If IMAGE_REGISTRY is set (environment or the repo's .env), the image is pushed there as
+# <registry>/cnn-client:<short commit>; otherwise, if IMAGE_IMPORT_CMD is set, it is loaded with it,
+# e.g. IMAGE_IMPORT_CMD='sudo ctr -n k8s.io images import -'. The last line printed is the reference
+# to give the pods.
 set -euo pipefail
 
 if [[ $# -lt 1 || $# -gt 3 ]]; then
-  sed -n '2,16p' "$0" >&2
+  sed -n '2,19p' "$0" >&2
   exit 1
 fi
 cnn="$(cd "$1" && pwd)"
@@ -57,5 +59,5 @@ docker build -q -t "$image" \
   ${model_name:+--label "io.github.dc4learning.model.name=$model_name"} \
   --label "io.github.dc4learning.model.source=DigitalCurling4-CNN src/engine/model/$model_file" \
   "$ctx" >/dev/null
-versions register-image "$image" --client-commit "$commit"
-import_image "$image"
+versions register-image "$image" --client-commit "$commit" >&2
+publish_image "$image"
