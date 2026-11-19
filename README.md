@@ -90,8 +90,9 @@ kubectl access to the namespace. Game defaults are the official 10-end setting (
 (`KEY=VALUE[,KEY=VALUE...]`); `DC_TEAM_NAME_FULL=1` makes clients from DigitalCurling4-CNN #33 on
 send a team name with their build ID and model and table hashes, which the server records.
 
-The namespace needs one Secret per team (keys `auth-id`, `auth-pw`) and the client image on the GPU
-node (`imagePullPolicy: IfNotPresent`, so an image imported into containerd works). Pods use
+The namespace needs one Secret per team (keys `auth-id`, `auth-pw`) and the client image where the GPU
+node can get it: in a registry the node pulls from (`IMAGE_REGISTRY`, see below), or imported into its
+containerd (`imagePullPolicy: IfNotPresent`). Pods use
 `runtimeClassName: nvidia` by default; without the NVIDIA runtime they get a GPU slot but no device.
 
 ## Logs, training and evaluation
@@ -103,11 +104,17 @@ the trained model, play it against the current one, and promote it if it wins.
 scripts/client-image.sh ../DigitalCurling4-CNN origin/development gen0   # cnn-client:<commit>, model named gen0
 python -m dc4learning.data build --model gen0          # data/datasets/selfplay-gen0-n<matches>-<hash>.npz
 python -m dc4learning.train --data data/datasets/selfplay-gen0-n<...>.npz --init data/models/best.pt --name gen1
-scripts/model-image.sh runs/gen1/gen1-e007-p<...>.pt   # cnn-client:<commit>_gen1-<hash>, imported via IMAGE_IMPORT_CMD
+scripts/model-image.sh runs/gen1/gen1-e007-p<...>.pt   # cnn-client:<commit>_gen1-<hash>, pushed to IMAGE_REGISTRY
 python -m dc4learning.selfplay --opponent-image cnn-client:<commit>_gen1-<hash> --matches 200   # evaluation
 python -m dc4learning.wintable --model gen0            # optional: a win table from the same games
 python -m dc4learning.stats                            # wins per client/model pair, binomial test
 ```
+
+With `IMAGE_REGISTRY` set (e.g. in `.env`), the image scripts push what they build to
+`<registry>/cnn-client:<tag>` and print that reference last; give it to `selfplay`. A base image
+(`BASE_IMAGE`) can be a registry reference, such as a released client pushed there; it is pulled and
+recorded first. The registry reference and the local tag are the same image ID, so both give the same
+version ID in match names. Without `IMAGE_REGISTRY`, `IMAGE_IMPORT_CMD` loads the image into the node.
 
 Training targets come from the logs: the policy target is the shot the client chose (the server's
 `actual_*` fields, before execution noise; note that the server logs the negative of the client's
