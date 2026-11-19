@@ -123,3 +123,32 @@ def action_to_shot(action: int) -> tuple[float, float, float]:
 def score_class(hammer_points: int) -> int:
     """Score-head class of the hammer team's net points in an end."""
     return int(np.clip(hammer_points, -SCORE_OFFSET, SCORE_OFFSET)) + SCORE_OFFSET
+
+
+# --- left-right mirror (data augmentation) ---
+# x -> -x is a symmetry of the sheet: the mirrored position, with each shot's angle mirrored and its
+# curl reversed, plays out the same, and the end score is unchanged. On the grids: stone column
+# c -> 16 - c (column 8 is the centre line; stones in play use columns 3..13), shot angle index
+# k -> 32 - k (16 is straight) with the other rotation. Index 0 has no mirror on the grid, and the
+# client's legal mask is symmetric about 15.5 rather than 16, so a few mirrored shots aren't
+# playable: those samples keep their score target and lose their policy target.
+
+
+def mirror_pixels(pixels):
+    """`stone_pixels` arrays (..., 2, 8, 2) mirrored left-right; -1 (no stone) stays -1."""
+    out = pixels.copy()
+    present = out[..., 0] >= 0
+    out[..., 1] = np.where(present, WIDTH - out[..., 1], -1)
+    return out
+
+
+def mirror_actions(actions):
+    """Policy indices mirrored left-right; -1 where the mirror is off the grid or not legal."""
+    a = np.asarray(actions).astype(np.int64)
+    rotation, rest = np.divmod(np.maximum(a, 0), POLICY_SPEED * POLICY_ANGLE)
+    speed, angle = np.divmod(rest, POLICY_ANGLE)
+    angle2 = POLICY_ANGLE - angle
+    out = (1 - rotation) * POLICY_SPEED * POLICY_ANGLE + speed * POLICY_ANGLE + np.minimum(angle2, POLICY_ANGLE - 1)
+    ok = (a >= 0) & (angle2 < POLICY_ANGLE)
+    ok &= LEGAL_MASK[np.where(ok, out, 0)]
+    return np.where(ok, out, -1)

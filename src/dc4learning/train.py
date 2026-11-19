@@ -26,7 +26,7 @@ import torch
 import torch.nn.functional as F
 
 from .config import runs_dir
-from .encoding import LEGAL_MASK, encode_batch
+from .encoding import LEGAL_MASK, encode_batch, mirror_actions, mirror_pixels
 from .model import PolicyValueNetwork, export, load
 from .naming import HASH, finalize, next_gen, parse, sha256
 
@@ -137,6 +137,8 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--lr", type=float, default=0.003)
     p.add_argument("--momentum", type=float, default=0.9)
     p.add_argument("--weight-decay", type=float, default=3e-4)
+    p.add_argument("--lr-schedule", choices=["constant", "cosine"], default="constant")
+    p.add_argument("--mirror", action="store_true", help="add a left-right mirrored copy of every training sample")
     p.add_argument("--policy-weight", type=float, default=1.0)
     p.add_argument("--val-frac", type=float, default=0.05, help="fraction of matches held out")
     p.add_argument("--seed", type=int, default=0, help="also picks the validation matches")
@@ -186,10 +188,30 @@ def main(argv: list[str] | None = None) -> int:
 
     data = load_dataset(args.data, device)
     train_idx, val_idx = split_by_match(data["match"], args.val_frac, args.seed, args.train_matches)
+    if args.mirror:
+        # Append a left-right mirrored copy of every training sample (validation stays as played).
+        n = len(data["shot"])
+        tr = train_idx.cpu().numpy()
+        pix = torch.from_numpy(mirror_pixels(data["pixels"][train_idx].cpu().numpy())).to(device)
+        pol = torch.from_numpy(mirror_actions(data["policy"][train_idx].cpu().numpy())).to(device)
+        data["pixels"] = torch.cat([data["pixels"], pix])
+        data["policy"] = torch.cat([data["policy"], pol])
+        for k in ("shot", "score", "match"):
+            data[k] = torch.cat([data[k], data[k][train_idx]])
+        train_idx = torch.cat([train_idx, torch.arange(n, n + len(tr), device=device)])
+        kept = int((pol >= 0).sum()) / max(1, int((data["policy"][train_idx[: len(tr)]] >= 0).sum()))
+        print(f"mirror: {len(tr)} mirrored samples added ({kept:.1%} keep a policy target)", file=sys.stderr)
     print(f"{len(train_idx)} train / {len(val_idx)} validation samples", file=sys.stderr)
 
     model = (load(args.init) if args.init else PolicyValueNetwork()).to(device)
     opt = torch.optim.SGD(model.parameters(), lr=args.lr, momentum=args.momentum, weight_decay=args.weight_decay)
+    # cosine: decay the learning rate to 0 over all steps (stepped per batch); constant: the DC3 recipe.
+    steps_per_epoch = (len(train_idx) + args.batch_size - 1) // args.batch_size
+    sched = (
+        torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=max(1, args.epochs * steps_per_epoch))
+        if args.lr_schedule == "cosine"
+        else None
+    )
     scaler = torch.amp.GradScaler(device.type, enabled=amp)
     writer = SummaryWriter(out)
     writer.add_text("args", json.dumps(vars(args), default=str, indent=1))
@@ -224,6 +246,8 @@ def main(argv: list[str] | None = None) -> int:
             scaler.scale(loss).backward()
             scaler.step(opt)
             scaler.update()
+            if sched:
+                sched.step()
             step += 1
             run["loss"] += loss.item()
             run["loss_policy"] += lp.item()
