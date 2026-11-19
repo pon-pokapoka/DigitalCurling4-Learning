@@ -5,6 +5,7 @@ Only the GET endpoints are used; they need no authentication.
 
 from __future__ import annotations
 
+import fnmatch
 import json
 import os
 import time
@@ -25,6 +26,11 @@ SHOT_COLS = [
     "actual_angular_velocity",
     "actual_shot_angle",
 ]
+
+
+def matches_any(name: str | None, patterns: str) -> bool:
+    """Whether `name` matches one of the comma-separated shell-style `patterns` (case-sensitive)."""
+    return any(fnmatch.fnmatchcase(name or "", p.strip()) for p in patterns.split(",") if p.strip())
 
 
 class DC4Client:
@@ -54,9 +60,12 @@ class DC4Client:
                     raise
             time.sleep(min(30, 2**attempt))
 
-    def list_matches(self) -> pd.DataFrame:
-        """All matches in all tournaments, newest first."""
+    def list_matches(self, tournament: str | None = None) -> pd.DataFrame:
+        """All matches in all tournaments, newest first; with `tournament`, only those in tournaments
+        whose name matches it (shell-style wildcards; several patterns: comma-separated)."""
         names = sorted({t["tournament_name"] for t in self.get("/tournaments")})
+        if tournament:
+            names = [n for n in names if matches_any(n, tournament)]
         rows = [m for name in names for m in self.get("/matches", tournament_name=name)]
         df = pd.DataFrame(rows)
         if df.empty:

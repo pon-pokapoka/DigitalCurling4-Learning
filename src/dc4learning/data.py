@@ -2,6 +2,7 @@
 
     python -m dc4learning.data build --model gen0    # dataset from games where both teams ran gen0
     python -m dc4learning.data build --since 2026-11-10T10:03
+    python -m dc4learning.data build --tournament 'selfplay-ddff1ad.gen1.*,selfplay-ddff1ad.gen2a.*'
 
 The games are read from the server whenever they're needed (`games`, `load_match`); nothing the
 server's database already holds is kept here. What is kept, under `config.data_dir()` (default
@@ -26,7 +27,7 @@ import numpy as np
 import pandas as pd
 
 from . import versions
-from .api import DC4Client
+from .api import DC4Client, matches_any
 from .config import data_dir
 from .encoding import score_class, shot_to_action, stone_pixels
 from .naming import finalize, slug
@@ -99,15 +100,20 @@ def _summary(match_id: str) -> dict | None:
     return summary
 
 
-def games(prefix: str = "selfplay-", since: str | None = None, workers: int = 8) -> pd.DataFrame:
+def games(
+    prefix: str = "selfplay-", since: str | None = None, workers: int = 8, tournament: str | None = None
+) -> pd.DataFrame:
     """Finished matches whose name starts with `prefix`, read from the server: one row per match
-    with its summary, each team's versions (dc4learning.versions) and the flags below.
+    with its summary, each team's versions (dc4learning.versions) and the flags below. With
+    `tournament` (tournament-name patterns, see `api.matches_any`), the matches of those tournaments
+    instead, whatever their names: only those are listed and read.
 
     Nothing is stored locally: the server's database is the record of the games."""
-    listed = _server().list_matches()
+    listed = _server().list_matches(tournament)
     if listed.empty:
         return listed
-    listed = listed[listed["match_name"].fillna("").str.startswith(prefix)]
+    if not tournament:
+        listed = listed[listed["match_name"].fillna("").str.startswith(prefix)]
     if since:
         listed = listed[pd.to_datetime(listed["started_at"]) >= pd.Timestamp(since)]
     ids = listed["match_id"].tolist()
@@ -192,9 +198,13 @@ def select_matches(
     since: str | None = None,
     include_interrupted: bool = False,
     include_time_losses: bool = True,
+    until: str | None = None,
+    tournament: str | None = None,
 ) -> pd.DataFrame:
-    """Matches where both teams match the filters: `model` is a model name or sha256 prefix,
-    `client` a client commit, `image` an image tag; `since` a start time.
+    """Matches where both teams match the filters: `model` is a model name or sha256 prefix, or
+    several separated by commas (each team plays one of them), `client` a client commit, `image` an
+    image tag; `since` / `until` bound the start time (until: exclusive); `tournament` keeps the
+    matches of tournaments whose name matches it (shell-style wildcards, comma-separated).
     Interrupted matches are left out, and games lost on time too if `include_time_losses` is False
     (see `games`)."""
     if not include_interrupted and "interrupted" in index:
@@ -206,19 +216,32 @@ def select_matches(
     if client:
         index = index[(index["client0"] == client) & (index["client1"] == client)]
     if model:
+        models = [m.strip() for m in model.split(",") if m.strip()]
 
         def is_model(t):
-            return (index[f"model{t}"] == model) | index[f"model_sha256{t}"].fillna("").str.startswith(model)
+            sha = index[f"model_sha256{t}"].fillna("")
+            return index[f"model{t}"].isin(models) | sha.apply(lambda h: any(h.startswith(m) for m in models))
 
         index = index[is_model(0) & is_model(1)]
     if since:
         index = index[index["started_at"] >= pd.Timestamp(since)]
+    if until:
+        index = index[index["started_at"] < pd.Timestamp(until)]
+    if tournament:
+        index = index[[matches_any(n, tournament) for n in index["tournament_name"]]]
     return index
 
 
-def selection_label(prefix: str, image=None, model=None, client=None, since=None) -> str:
+def selection_label(prefix: str, image=None, model=None, client=None, since=None, tournament=None) -> str:
     """The <selection> part of dataset and win table names, e.g. selfplay-gen0."""
-    parts = [prefix, model, client and f"client-{client}", image and f"image-{image}", since and f"since-{since}"]
+    parts = [
+        prefix,
+        model,
+        client and f"client-{client}",
+        image and f"image-{image}",
+        since and f"since-{since}",
+        tournament and f"tournament-{tournament}",
+    ]
     return slug("-".join(p for p in parts if p))
 
 
@@ -243,6 +266,8 @@ def build_dataset(
     root: Path | None = None,
     model: str | None = None,
     client: str | None = None,
+    until: str | None = None,
+    tournament: str | None = None,
 ) -> Path:
     """Samples of finished matches (read from the server) where both teams match the filters.
 
@@ -250,8 +275,10 @@ def build_dataset(
     match IDs, the versions that played them, and the commit of this code (dc4learning.naming).
     """
     root = root or data_dir()
-    index = select_matches(games(since=since), image, model, client)
-    selection = slug(selection or selection_label("selfplay", image, model, client, since))
+    index = select_matches(
+        games(since=since, tournament=tournament), image, model, client, until=until, tournament=tournament
+    )
+    selection = slug(selection or selection_label("selfplay", image, model, client, since, tournament))
     cols = {k: [] for k in ("pixels", "shot", "policy", "score", "end", "team", "won", "match")}
     for i, match_id in enumerate(index["match_id"]):
         meta, states = load_match(match_id)
@@ -279,7 +306,14 @@ def build_dataset(
         ".npz",
         {
             "kind": "dataset",
-            "params": {"image": image, "model": model, "client": client, "since": since},
+            "params": {
+                "image": image,
+                "model": model,
+                "client": client,
+                "since": since,
+                "until": until,
+                "tournament": tournament,
+            },
             "samples": len(arrays["shot"]),
             "played_by": played_by(index),
             "match_ids": index["match_id"].tolist(),
@@ -300,11 +334,28 @@ def main(argv: list[str] | None = None) -> int:
     b = sub.add_parser("build", help="build a training dataset from finished matches on the server")
     b.add_argument("--selection", default=None, help="name part before -n<matches> (default: from the filters)")
     b.add_argument("--image", help="only matches where both teams used this client image (tag)")
-    b.add_argument("--model", help="only matches where both teams used this model (name or sha256 prefix)")
+    b.add_argument(
+        "--model",
+        help="only matches where both teams used this model (name or sha256 prefix; several: comma-separated)",
+    )
     b.add_argument("--client", help="only matches where both teams used this client commit")
     b.add_argument("--since", help="only matches started at or after this time, e.g. 2026-11-09T02:30")
+    b.add_argument("--until", help="only matches started before this time")
+    b.add_argument(
+        "--tournament",
+        help="only matches in tournaments with this name (shell-style wildcards; several: comma-separated)."
+        " Any match name, so evaluation tournaments can be chosen too",
+    )
     args = p.parse_args(argv)
-    build_dataset(args.selection, args.image, args.since, model=args.model, client=args.client)
+    build_dataset(
+        args.selection,
+        args.image,
+        args.since,
+        model=args.model,
+        client=args.client,
+        until=args.until,
+        tournament=args.tournament,
+    )
     return 0
 
 
